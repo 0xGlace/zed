@@ -28,10 +28,10 @@ use git_ui::commit_view::CommitViewToolbar;
 use git_ui::git_panel::GitPanel;
 use git_ui::project_diff::ProjectDiffToolbar;
 use gpui::{
-    Action, App, AppContext as _, AsyncApp, Context, DismissEvent, Element, Entity, Focusable,
-    KeyBinding, ParentElement, PathPromptOptions, PromptLevel, ReadGlobal, SharedString, Styled,
-    Task, TitlebarOptions, UpdateGlobal, Window, WindowKind, WindowOptions, actions, image_cache,
-    point, px, retain_all,
+    Action, App, AppContext as _, Context, DismissEvent, Element, Entity, Focusable, KeyBinding,
+    ParentElement, PathPromptOptions, PromptLevel, ReadGlobal, SharedString, Styled, Task,
+    TitlebarOptions, UpdateGlobal, Window, WindowKind, WindowOptions, actions, image_cache, point,
+    px, retain_all,
 };
 use image_viewer::ImageInfo;
 use language::Capability;
@@ -201,12 +201,7 @@ pub fn init(cx: &mut App) {
         with_active_or_new_workspace(cx, |_, window, cx| {
             open_settings_file(
                 paths::keymap_file(),
-                |cx| {
-                    Rope::from_str(
-                        settings::initial_keymap_content().as_ref(),
-                        cx.background_executor(),
-                    )
-                },
+                || settings::initial_keymap_content().as_ref().into(),
                 window,
                 cx,
             );
@@ -216,12 +211,7 @@ pub fn init(cx: &mut App) {
         with_active_or_new_workspace(cx, |_, window, cx| {
             open_settings_file(
                 paths::settings_file(),
-                |cx| {
-                    Rope::from_str(
-                        settings::initial_user_settings_content().as_ref(),
-                        cx.background_executor(),
-                    )
-                },
+                || settings::initial_user_settings_content().as_ref().into(),
                 window,
                 cx,
             );
@@ -236,12 +226,7 @@ pub fn init(cx: &mut App) {
         with_active_or_new_workspace(cx, |_, window, cx| {
             open_settings_file(
                 paths::tasks_file(),
-                |cx| {
-                    Rope::from_str(
-                        settings::initial_tasks_content().as_ref(),
-                        cx.background_executor(),
-                    )
-                },
+                || settings::initial_tasks_content().as_ref().into(),
                 window,
                 cx,
             );
@@ -251,12 +236,7 @@ pub fn init(cx: &mut App) {
         with_active_or_new_workspace(cx, |_, window, cx| {
             open_settings_file(
                 paths::debug_scenarios_file(),
-                |cx| {
-                    Rope::from_str(
-                        settings::initial_debug_tasks_content().as_ref(),
-                        cx.background_executor(),
-                    )
-                },
+                || settings::initial_debug_tasks_content().as_ref().into(),
                 window,
                 cx,
             );
@@ -294,16 +274,27 @@ pub fn init(cx: &mut App) {
 }
 
 fn bind_on_window_closed(cx: &mut App) -> Option<gpui::Subscription> {
-    WorkspaceSettings::get_global(cx)
-        .on_last_window_closed
-        .is_quit_app()
-        .then(|| {
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
+    #[cfg(target_os = "macos")]
+    {
+        WorkspaceSettings::get_global(cx)
+            .on_last_window_closed
+            .is_quit_app()
+            .then(|| {
+                cx.on_window_closed(|cx| {
+                    if cx.windows().is_empty() {
+                        cx.quit();
+                    }
+                })
             })
-        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        }))
+    }
 }
 
 pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowOptions {
@@ -735,7 +726,24 @@ fn register_actions(
                 ..Default::default()
             })
         })
-        .register_action(|_, action: &OpenBrowser, _window, cx| cx.open_url(&action.url))
+        .register_action(|workspace, action: &OpenBrowser, _window, cx| {
+            // Parse and validate the URL to ensure it's properly formatted
+            match url::Url::parse(&action.url) {
+                Ok(parsed_url) => {
+                    // Use the parsed URL's string representation which is properly escaped
+                    cx.open_url(parsed_url.as_str());
+                }
+                Err(e) => {
+                    workspace.show_error(
+                        &anyhow::anyhow!(
+                            "Opening this URL in a browser failed because the URL is invalid: {}\n\nError was: {e}",
+                            action.url
+                        ),
+                        cx,
+                    );
+                }
+            }
+        })
         .register_action(|workspace, _: &workspace::Open, window, cx| {
             telemetry::event!("Project Opened");
             let paths = workspace.prompt_for_open_path(
@@ -1428,9 +1436,6 @@ pub fn handle_keymap_file_changes(
     mut user_keymap_file_rx: mpsc::UnboundedReceiver<String>,
     cx: &mut App,
 ) {
-    BaseKeymap::register(cx);
-    vim_mode_setting::init(cx);
-
     let (base_keymap_tx, mut base_keymap_rx) = mpsc::unbounded();
     let (keyboard_layout_tx, mut keyboard_layout_rx) = mpsc::unbounded();
     let mut old_base_keymap = *BaseKeymap::get_global(cx);
@@ -1942,6 +1947,7 @@ fn open_bundled_file(
                             let mut editor =
                                 Editor::for_multibuffer(buffer, Some(project.clone()), window, cx);
                             editor.set_read_only(true);
+                            editor.set_should_serialize(false, cx);
                             editor.set_breadcrumb_header(title.into());
                             editor
                         })),
@@ -1959,7 +1965,7 @@ fn open_bundled_file(
 
 fn open_settings_file(
     abs_path: &'static Path,
-    default_content: impl FnOnce(&mut AsyncApp) -> Rope + Send + 'static,
+    default_content: impl FnOnce() -> Rope + Send + 'static,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -4091,7 +4097,9 @@ mod tests {
                     let editor = item.downcast::<Editor>().unwrap();
                     let (selections, scroll_position) = editor.update(cx, |editor, cx| {
                         (
-                            editor.selections.display_ranges(cx),
+                            editor
+                                .selections
+                                .display_ranges(&editor.display_snapshot(cx)),
                             editor.scroll_position(cx),
                         )
                     });
@@ -4348,10 +4356,8 @@ mod tests {
 
             theme::init(theme::LoadThemes::JustBase, cx);
             client::init(&app_state.client, cx);
-            language::init(cx);
             workspace::init(app_state.clone(), cx);
             onboarding::init(cx);
-            Project::init_settings(cx);
             app_state
         })
     }
@@ -4375,7 +4381,7 @@ mod tests {
             .fs
             .save(
                 "/settings.json".as_ref(),
-                &Rope::from_str_small(r#"{"base_keymap": "Atom"}"#),
+                &r#"{"base_keymap": "Atom"}"#.into(),
                 Default::default(),
             )
             .await
@@ -4385,7 +4391,7 @@ mod tests {
             .fs
             .save(
                 "/keymap.json".as_ref(),
-                &Rope::from_str_small(r#"[{"bindings": {"backspace": "test_only::ActionA"}}]"#),
+                &r#"[{"bindings": {"backspace": "test_only::ActionA"}}]"#.into(),
                 Default::default(),
             )
             .await
@@ -4433,7 +4439,7 @@ mod tests {
             .fs
             .save(
                 "/keymap.json".as_ref(),
-                &Rope::from_str_small(r#"[{"bindings": {"backspace": "test_only::ActionB"}}]"#),
+                &r#"[{"bindings": {"backspace": "test_only::ActionB"}}]"#.into(),
                 Default::default(),
             )
             .await
@@ -4453,7 +4459,7 @@ mod tests {
             .fs
             .save(
                 "/settings.json".as_ref(),
-                &Rope::from_str_small(r#"{"base_keymap": "JetBrains"}"#),
+                &r#"{"base_keymap": "JetBrains"}"#.into(),
                 Default::default(),
             )
             .await
@@ -4493,7 +4499,7 @@ mod tests {
             .fs
             .save(
                 "/settings.json".as_ref(),
-                &Rope::from_str_small(r#"{"base_keymap": "Atom"}"#),
+                &r#"{"base_keymap": "Atom"}"#.into(),
                 Default::default(),
             )
             .await
@@ -4502,7 +4508,7 @@ mod tests {
             .fs
             .save(
                 "/keymap.json".as_ref(),
-                &Rope::from_str_small(r#"[{"bindings": {"backspace": "test_only::ActionA"}}]"#),
+                &r#"[{"bindings": {"backspace": "test_only::ActionA"}}]"#.into(),
                 Default::default(),
             )
             .await
@@ -4545,7 +4551,7 @@ mod tests {
             .fs
             .save(
                 "/keymap.json".as_ref(),
-                &Rope::from_str_small(r#"[{"bindings": {"backspace": null}}]"#),
+                &r#"[{"bindings": {"backspace": null}}]"#.into(),
                 Default::default(),
             )
             .await
@@ -4565,7 +4571,7 @@ mod tests {
             .fs
             .save(
                 "/settings.json".as_ref(),
-                &Rope::from_str_small(r#"{"base_keymap": "JetBrains"}"#),
+                &r#"{"base_keymap": "JetBrains"}"#.into(),
                 Default::default(),
             )
             .await
@@ -4814,21 +4820,17 @@ mod tests {
 
             let state = Arc::get_mut(&mut app_state).unwrap();
             state.build_window_options = build_window_options;
-
             app_state.languages.add(markdown_language());
 
             gpui_tokio::init(cx);
-            vim_mode_setting::init(cx);
             theme::init(theme::LoadThemes::JustBase, cx);
             audio::init(cx);
             channel::init(&app_state.client, app_state.user_store.clone(), cx);
             call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
             notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
             workspace::init(app_state.clone(), cx);
-            Project::init_settings(cx);
             release_channel::init(SemanticVersion::default(), cx);
             command_palette::init(cx);
-            language::init(cx);
             editor::init(cx);
             collab_ui::init(&app_state, cx);
             git_ui::init(cx);

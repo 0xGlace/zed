@@ -65,6 +65,8 @@ actions!(
         OpenLicenses,
         /// Opens the telemetry log.
         OpenTelemetryLog,
+        /// Opens the performance profiler.
+        OpenPerformanceProfiler,
     ]
 );
 
@@ -214,7 +216,9 @@ pub mod git {
             #[action(deprecated_aliases = ["branches::OpenRecent"])]
             Branch,
             /// Opens the git stash selector.
-            ViewStash
+            ViewStash,
+            /// Opens the git worktree selector.
+            Worktree
         ]
     );
 }

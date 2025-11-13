@@ -33,10 +33,8 @@ pub mod search_history;
 mod yarn;
 
 use dap::inline_value::{InlineValueLocation, VariableLookupKind, VariableScope};
-use task::Shell;
 
 use crate::{
-    agent_server_store::AllAgentServersSettings,
     git_store::GitStore,
     lsp_store::{SymbolLocation, log_store::LogKind},
 };
@@ -68,7 +66,7 @@ use futures::future::join_all;
 use futures::{
     StreamExt,
     channel::mpsc::{self, UnboundedReceiver},
-    future::{Shared, try_join_all},
+    future::try_join_all,
 };
 pub use image_store::{ImageItem, ImageStore};
 use image_store::{ImageItemEvent, ImageStoreEvent};
@@ -102,9 +100,10 @@ use rpc::{
 };
 use search::{SearchInputKind, SearchQuery, SearchResult};
 use search_history::SearchHistory;
-use settings::{InvalidSettingsError, Settings, SettingsLocation, SettingsStore};
+use settings::{InvalidSettingsError, RegisterSetting, Settings, SettingsLocation, SettingsStore};
 use smol::channel::Receiver;
 use snippet::Snippet;
+pub use snippet_provider;
 use snippet_provider::SnippetProvider;
 use std::{
     borrow::Cow,
@@ -337,12 +336,15 @@ pub enum Event {
     HostReshared,
     Reshared,
     Rejoined,
-    RefreshInlayHints(LanguageServerId),
+    RefreshInlayHints {
+        server_id: LanguageServerId,
+        request_id: Option<usize>,
+    },
     RefreshCodeLens,
     RevealInProjectPanel(ProjectEntryId),
     SnippetEdit(BufferId, Vec<(lsp::Range, Snippet)>),
     ExpandedAllForEntry(WorktreeId, ProjectEntryId),
-    EntryRenamed(ProjectTransaction),
+    EntryRenamed(ProjectTransaction, ProjectPath, PathBuf),
     AgentLocationChanged,
 }
 
@@ -475,6 +477,12 @@ pub struct Completion {
     pub source: CompletionSource,
     /// A path to an icon for this completion that is shown in the menu.
     pub icon_path: Option<SharedString>,
+    /// Text starting here and ending at the cursor will be used as the query for filtering this completion.
+    ///
+    /// If None, the start of the surrounding word is used.
+    pub match_start: Option<text::Anchor>,
+    /// Key used for de-duplicating snippets. If None, always considered unique.
+    pub snippet_deduplication_key: Option<(usize, usize)>,
     /// Whether to adjust indentation (the default) or not.
     pub insert_text_mode: Option<InsertTextMode>,
     /// An optional callback to invoke when this completion is confirmed.
@@ -712,10 +720,8 @@ pub enum ResolveState {
 impl InlayHint {
     pub fn text(&self) -> Rope {
         match &self.label {
-            InlayHintLabel::String(s) => Rope::from_str_small(s),
-            InlayHintLabel::LabelParts(parts) => {
-                Rope::from_iter_small(parts.iter().map(|part| &*part.value))
-            }
+            InlayHintLabel::String(s) => Rope::from(s),
+            InlayHintLabel::LabelParts(parts) => parts.iter().map(|part| &*part.value).collect(),
         }
     }
 }
@@ -996,7 +1002,7 @@ pub enum PulledDiagnostics {
 /// Whether to disable all AI features in Zed.
 ///
 /// Default: false
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, RegisterSetting)]
 pub struct DisableAiSettings {
     pub disable_ai: bool,
 }
@@ -1010,16 +1016,8 @@ impl settings::Settings for DisableAiSettings {
 }
 
 impl Project {
-    pub fn init_settings(cx: &mut App) {
-        WorktreeSettings::register(cx);
-        ProjectSettings::register(cx);
-        DisableAiSettings::register(cx);
-        AllAgentServersSettings::register(cx);
-    }
-
     pub fn init(client: &Arc<Client>, cx: &mut App) {
         connection_manager::init(client.clone(), cx);
-        Self::init_settings(cx);
 
         let client: AnyProtoClient = client.clone().into();
         client.add_entity_message_handler(Self::handle_add_collaborator);
@@ -1037,6 +1035,7 @@ impl Project {
         client.add_entity_request_handler(Self::handle_open_new_buffer);
         client.add_entity_message_handler(Self::handle_create_buffer_for_peer);
         client.add_entity_message_handler(Self::handle_toggle_lsp_logs);
+        client.add_entity_message_handler(Self::handle_create_image_for_peer);
 
         WorktreeStore::init(&client);
         BufferStore::init(&client);
@@ -1070,9 +1069,11 @@ impl Project {
 
             let weak_self = cx.weak_entity();
             let context_server_store =
-                cx.new(|cx| ContextServerStore::new(worktree_store.clone(), weak_self, cx));
+                cx.new(|cx| ContextServerStore::new(worktree_store.clone(), weak_self.clone(), cx));
 
-            let environment = cx.new(|cx| ProjectEnvironment::new(env, cx));
+            let environment = cx.new(|cx| {
+                ProjectEnvironment::new(env, worktree_store.downgrade(), None, false, cx)
+            });
             let manifest_tree = ManifestTree::new(worktree_store.clone(), cx);
             let toolchain_store = cx.new(|cx| {
                 ToolchainStore::local(
@@ -1261,7 +1262,7 @@ impl Project {
 
             let weak_self = cx.weak_entity();
             let context_server_store =
-                cx.new(|cx| ContextServerStore::new(worktree_store.clone(), weak_self, cx));
+                cx.new(|cx| ContextServerStore::new(worktree_store.clone(), weak_self.clone(), cx));
 
             let buffer_store = cx.new(|cx| {
                 BufferStore::remote(
@@ -1307,7 +1308,15 @@ impl Project {
             cx.subscribe(&settings_observer, Self::on_settings_observer_event)
                 .detach();
 
-            let environment = cx.new(|cx| ProjectEnvironment::new(None, cx));
+            let environment = cx.new(|cx| {
+                ProjectEnvironment::new(
+                    None,
+                    worktree_store.downgrade(),
+                    Some(remote.downgrade()),
+                    false,
+                    cx,
+                )
+            });
 
             let lsp_store = cx.new(|cx| {
                 LspStore::new_remote(
@@ -1423,6 +1432,7 @@ impl Project {
             remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.agent_server_store);
 
             remote_proto.add_entity_message_handler(Self::handle_create_buffer_for_peer);
+            remote_proto.add_entity_message_handler(Self::handle_create_image_for_peer);
             remote_proto.add_entity_message_handler(Self::handle_update_worktree);
             remote_proto.add_entity_message_handler(Self::handle_update_project);
             remote_proto.add_entity_message_handler(Self::handle_toast);
@@ -1520,8 +1530,8 @@ impl Project {
             ImageStore::remote(worktree_store.clone(), client.clone().into(), remote_id, cx)
         })?;
 
-        let environment = cx.new(|cx| ProjectEnvironment::new(None, cx))?;
-
+        let environment =
+            cx.new(|cx| ProjectEnvironment::new(None, worktree_store.downgrade(), None, true, cx))?;
         let breakpoint_store =
             cx.new(|_| BreakpointStore::remote(remote_id, client.clone().into()))?;
         let dap_store = cx.new(|cx| {
@@ -1925,32 +1935,6 @@ impl Project {
         self.environment.read(cx).get_cli_environment()
     }
 
-    pub fn buffer_environment<'a>(
-        &'a self,
-        buffer: &Entity<Buffer>,
-        worktree_store: &Entity<WorktreeStore>,
-        cx: &'a mut App,
-    ) -> Shared<Task<Option<HashMap<String, String>>>> {
-        self.environment.update(cx, |environment, cx| {
-            environment.get_buffer_environment(buffer, worktree_store, cx)
-        })
-    }
-
-    pub fn directory_environment(
-        &self,
-        shell: &Shell,
-        abs_path: Arc<Path>,
-        cx: &mut App,
-    ) -> Shared<Task<Option<HashMap<String, String>>>> {
-        self.environment.update(cx, |environment, cx| {
-            if let Some(remote_client) = self.remote_client.clone() {
-                environment.get_remote_directory_environment(shell, abs_path, remote_client, cx)
-            } else {
-                environment.get_local_directory_environment(shell, abs_path, cx)
-            }
-        })
-    }
-
     #[inline]
     pub fn peek_environment_error<'a>(&'a self, cx: &'a App) -> Option<&'a String> {
         self.environment.read(cx).peek_environment_error()
@@ -2264,7 +2248,11 @@ impl Project {
 
             project
                 .update(cx, |_, cx| {
-                    cx.emit(Event::EntryRenamed(transaction));
+                    cx.emit(Event::EntryRenamed(
+                        transaction,
+                        new_path.clone(),
+                        new_abs_path.clone(),
+                    ));
                 })
                 .ok();
 
@@ -2865,13 +2853,20 @@ impl Project {
         let weak_project = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let image_item = open_image_task.await?;
-            let project = weak_project.upgrade().context("Project dropped")?;
 
-            let metadata = ImageItem::load_image_metadata(image_item.clone(), project, cx).await?;
-            image_item.update(cx, |image_item, cx| {
-                image_item.image_metadata = Some(metadata);
-                cx.emit(ImageItemEvent::MetadataUpdated);
-            })?;
+            // Check if metadata already exists (e.g., for remote images)
+            let needs_metadata =
+                cx.read_entity(&image_item, |item, _| item.image_metadata.is_none())?;
+
+            if needs_metadata {
+                let project = weak_project.upgrade().context("Project dropped")?;
+                let metadata =
+                    ImageItem::load_image_metadata(image_item.clone(), project, cx).await?;
+                image_item.update(cx, |image_item, cx| {
+                    image_item.image_metadata = Some(metadata);
+                    cx.emit(ImageItemEvent::MetadataUpdated);
+                })?;
+            }
 
             Ok(image_item)
         })
@@ -3076,9 +3071,13 @@ impl Project {
                     return;
                 };
             }
-            LspStoreEvent::RefreshInlayHints(server_id) => {
-                cx.emit(Event::RefreshInlayHints(*server_id))
-            }
+            LspStoreEvent::RefreshInlayHints {
+                server_id,
+                request_id,
+            } => cx.emit(Event::RefreshInlayHints {
+                server_id: *server_id,
+                request_id: *request_id,
+            }),
             LspStoreEvent::RefreshCodeLens => cx.emit(Event::RefreshCodeLens),
             LspStoreEvent::LanguageServerPrompt(prompt) => {
                 cx.emit(Event::LanguageServerPrompt(prompt.clone()))
@@ -3331,6 +3330,7 @@ impl Project {
         event: &ImageItemEvent,
         cx: &mut Context<Self>,
     ) -> Option<()> {
+        // TODO: handle image events from remote
         if let ImageItemEvent::ReloadNeeded = event
             && !self.is_via_collab()
         {
@@ -4067,7 +4067,7 @@ impl Project {
         result_rx
     }
 
-    fn find_search_candidate_buffers(
+    pub fn find_search_candidate_buffers(
         &mut self,
         query: &SearchQuery,
         limit: usize,
@@ -5068,6 +5068,20 @@ impl Project {
         buffer.read(cx).remote_id()
     }
 
+    async fn handle_create_image_for_peer(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::CreateImageForPeer>,
+        mut cx: AsyncApp,
+    ) -> Result<()> {
+        this.update(&mut cx, |this, cx| {
+            this.image_store.update(cx, |image_store, cx| {
+                image_store.handle_create_image_for_peer(envelope, cx)
+            })
+        })?
+        .log_err();
+        Ok(())
+    }
+
     fn synchronize_remote_buffers(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
         let project_id = match self.client_state {
             ProjectClientState::Remote {
@@ -5404,12 +5418,7 @@ impl Project {
             worktree
                 .update(cx, |worktree, cx| {
                     let line_ending = text::LineEnding::detect(&new_text);
-                    worktree.write_file(
-                        rel_path.clone(),
-                        Rope::from_str(&new_text, cx.background_executor()),
-                        line_ending,
-                        cx,
-                    )
+                    worktree.write_file(rel_path.clone(), new_text.into(), line_ending, cx)
                 })?
                 .await
                 .context("Failed to write settings file")?;
@@ -5641,6 +5650,15 @@ impl Completion {
     }
 
     /// Whether this completion is a snippet.
+    pub fn is_snippet_kind(&self) -> bool {
+        matches!(
+            &self.source,
+            CompletionSource::Lsp { lsp_completion, .. }
+            if lsp_completion.kind == Some(CompletionItemKind::SNIPPET)
+        )
+    }
+
+    /// Whether this completion is a snippet or snippet-style LSP completion.
     pub fn is_snippet(&self) -> bool {
         self.source
             // `lsp::CompletionListItemDefaults` has `insert_text_format` field
@@ -5748,7 +5766,6 @@ mod disable_ai_settings_tests {
     async fn test_disable_ai_settings_security(cx: &mut TestAppContext) {
         cx.update(|cx| {
             settings::init(cx);
-            Project::init_settings(cx);
 
             // Test 1: Default is false (AI enabled)
             assert!(
